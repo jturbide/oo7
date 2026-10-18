@@ -363,12 +363,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(
             return PAM_SUCCESS;
         }
 
-        tracing::info!(
-            "Password change for user {}: old={} bytes, new={} bytes",
-            username,
-            old_password.len(),
-            new_password.len()
-        );
+        tracing::info!("Password change for user {}", username);
 
         let message = PamMessage::change_password(
             username.clone(),
@@ -380,13 +375,13 @@ pub unsafe extern "C" fn pam_sm_chauthtok(
         // returns.
         match send_secret_to_daemon(message, user_uid, user_gid, false) {
             Ok(_) => {
-                tracing::info!(
-                    "Successfully sent password change request to oo7 daemon for user: {}",
-                    username
-                );
+                tracing::info!("Daemon acknowledged password change for user: {}", username);
             }
             Err(e) => {
-                tracing::error!("Failed to send password change to oo7 daemon: {}", e);
+                tracing::error!(
+                    "Failed to change keyring password through oo7 daemon: {}",
+                    e
+                );
             }
         }
 

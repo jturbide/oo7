@@ -14,8 +14,9 @@ use zeroize::Zeroizing;
 
 use crate::protocol::{PamMessage, PamResponse};
 
-/// Timeout for socket operations (in milliseconds)
+/// Deadline for the complete socket exchange (in milliseconds).
 const SOCKET_TIMEOUT_MS: u64 = 5000;
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 struct SavedSignals {
     sigpipe: libc::sigaction,
@@ -56,9 +57,12 @@ impl Drop for SavedSignals {
 pub enum SocketError {
     Connect(io::Error),
     Send(io::Error),
+    Receive(io::Error),
     Serialize(zgvariant::Error),
     Timeout,
     InvalidSocket(String),
+    InvalidResponse(&'static str),
+    Rejected,
 }
 
 impl std::fmt::Display for SocketError {
@@ -66,9 +70,12 @@ impl std::fmt::Display for SocketError {
         match self {
             Self::Connect(e) => write!(f, "Failed to connect to daemon socket: {e}"),
             Self::Send(e) => write!(f, "Failed to send message: {e}"),
+            Self::Receive(e) => write!(f, "Failed to receive daemon response: {e}"),
             Self::Serialize(e) => write!(f, "Failed to serialize message: {e}"),
             Self::Timeout => write!(f, "Operation timed out"),
             Self::InvalidSocket(msg) => write!(f, "Invalid socket: {msg}"),
+            Self::InvalidResponse(msg) => write!(f, "Invalid daemon response: {msg}"),
+            Self::Rejected => write!(f, "Daemon rejected request"),
         }
     }
 }
@@ -76,9 +83,11 @@ impl std::fmt::Display for SocketError {
 impl std::error::Error for SocketError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Connect(e) | Self::Send(e) => Some(e),
+            Self::Connect(e) | Self::Send(e) | Self::Receive(e) => Some(e),
             Self::Serialize(e) => Some(e),
-            Self::Timeout | Self::InvalidSocket(_) => None,
+            Self::Timeout | Self::InvalidSocket(_) | Self::InvalidResponse(_) | Self::Rejected => {
+                None
+            }
         }
     }
 }
@@ -117,7 +126,11 @@ pub fn send_secret_to_daemon(
         }
         0 => {
             unsafe {
-                if libc::setgid(gid) < 0
+                // Do not pass the privileged caller's supplementary groups to
+                // the target user or the login helper it may
+                // exec.
+                if (current_euid == 0 && libc::setgroups(0, std::ptr::null()) < 0)
+                    || libc::setgid(gid) < 0
                     || libc::setuid(uid) < 0
                     || libc::setegid(gid) < 0
                     || libc::seteuid(uid) < 0
@@ -268,6 +281,20 @@ async fn send_secret_to_daemon_async(
     auto_start: bool,
     socket_path: Option<PathBuf>,
 ) -> Result<(), SocketError> {
+    timeout(
+        Duration::from_millis(SOCKET_TIMEOUT_MS),
+        exchange_with_daemon(message, uid, auto_start, socket_path),
+    )
+    .await
+    .map_err(|_| SocketError::Timeout)?
+}
+
+async fn exchange_with_daemon(
+    message: PamMessage,
+    uid: u32,
+    auto_start: bool,
+    socket_path: Option<PathBuf>,
+) -> Result<(), SocketError> {
     let socket_path = socket_path
         .or_else(|| std::env::var("OO7_PAM_SOCKET").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}/oo7-pam.sock")));
@@ -306,23 +333,15 @@ async fn send_secret_to_daemon_async(
         }
     }
 
-    let mut stream = match timeout(
-        Duration::from_millis(SOCKET_TIMEOUT_MS),
-        UnixStream::connect(&socket_path),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) if auto_start => {
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(e) if auto_start => {
             tracing::info!("Daemon not running ({}), starting login helper", e.kind());
             start_login_helper(&message.new_secret)?;
             return Ok(());
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             return Err(SocketError::Connect(e));
-        }
-        Err(_) => {
-            return Err(SocketError::Timeout);
         }
     };
 
@@ -337,52 +356,39 @@ async fn send_secret_to_daemon_async(
         .await
         .map_err(SocketError::Send)?;
 
-    timeout(
-        Duration::from_millis(SOCKET_TIMEOUT_MS),
-        stream.write_all(&message_bytes),
-    )
-    .await
-    .map_err(|_| SocketError::Timeout)?
-    .map_err(SocketError::Send)?;
+    stream
+        .write_all(&message_bytes)
+        .await
+        .map_err(SocketError::Send)?;
 
     stream.flush().await.map_err(SocketError::Send)?;
 
     tracing::debug!("Sent message to daemon, reading response");
 
     let mut length_bytes = [0u8; 4];
-    match timeout(
-        Duration::from_millis(SOCKET_TIMEOUT_MS),
-        stream.read_exact(&mut length_bytes),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            let length = u32::from_le_bytes(length_bytes) as usize;
-            let mut response_bytes = vec![0u8; length];
-            if let Ok(Ok(_)) = timeout(
-                Duration::from_millis(SOCKET_TIMEOUT_MS),
-                stream.read_exact(&mut response_bytes),
-            )
-            .await
-            {
-                match PamResponse::from_bytes(&response_bytes) {
-                    Ok(response) if response.success => {
-                        tracing::debug!("Daemon accepted secret");
-                    }
-                    Ok(response) => {
-                        tracing::warn!("Daemon rejected secret: {}", response.error_message);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse daemon response: {e}");
-                    }
-                }
-            }
-        }
-        _ => {
-            tracing::debug!("No response from daemon");
-        }
+    stream
+        .read_exact(&mut length_bytes)
+        .await
+        .map_err(SocketError::Receive)?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length == 0 || length > MAX_RESPONSE_BYTES {
+        return Err(SocketError::InvalidResponse("invalid frame length"));
+    }
+    let mut response_bytes = Zeroizing::new(vec![0u8; length]);
+    stream
+        .read_exact(&mut response_bytes)
+        .await
+        .map_err(SocketError::Receive)?;
+    let response = PamResponse::from_bytes(&response_bytes)
+        .map_err(|_| SocketError::InvalidResponse("malformed payload"))?;
+    let _error_message = Zeroizing::new(response.error_message);
+    if !response.success {
+        // Do not place daemon-controlled response payloads in authentication
+        // logs.
+        return Err(SocketError::Rejected);
     }
 
+    tracing::debug!("Daemon acknowledged request");
     Ok(())
 }
 
@@ -392,39 +398,126 @@ mod tests {
 
     use super::*;
 
+    fn response_frame(success: bool) -> Vec<u8> {
+        #[derive(serde::Serialize, zgvariant::Type)]
+        struct Response {
+            success: bool,
+            error_message: String,
+        }
+        let response = Response {
+            success,
+            error_message: String::new(),
+        };
+        let context = zgvariant::serialized::Context::new(zgvariant::LE, 0);
+        let bytes = zgvariant::to_bytes(context, &response).unwrap();
+        let mut frame = (bytes.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        frame
+    }
+
+    async fn read_request(stream: &mut UnixStream) -> PamMessage {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
+        stream.read_exact(&mut bytes).await.unwrap();
+        PamMessage::from_bytes(&bytes).unwrap()
+    }
+
     #[tokio::test]
     async fn test_send_receive() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let socket_path = temp_dir.path().join("test.sock");
-
-        let socket_path_clone = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path)?;
         let server = tokio::spawn(async move {
-            let listener = UnixListener::bind(&socket_path_clone).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
-
-            let mut length_bytes = [0u8; 4];
-            stream.read_exact(&mut length_bytes).await.unwrap();
-            let message_length = u32::from_le_bytes(length_bytes) as usize;
-
-            let mut message_bytes = vec![0u8; message_length];
-            stream.read_exact(&mut message_bytes).await.unwrap();
-
-            let message = PamMessage::from_bytes(&message_bytes).unwrap();
+            let message = read_request(&mut stream).await;
             assert_eq!(message.username, "testuser");
             assert_eq!(message.new_secret, b"testpassword");
+            stream.write_all(&response_frame(true)).await.unwrap();
         });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let message = PamMessage::unlock("testuser".to_string(), b"testpassword".to_vec());
 
-        // The socket must be owned by the given UID
-        let uid = unsafe { libc::getuid() };
-        let result = send_secret_to_daemon_async(message, uid, false, Some(socket_path)).await;
+        let result = send_secret_to_daemon_async(
+            message,
+            unsafe { libc::geteuid() },
+            false,
+            Some(socket_path),
+        )
+        .await;
         assert!(result.is_ok());
 
         server.await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_response_failures() -> Result<(), Box<dyn std::error::Error>> {
+        let frames = [
+            response_frame(false),
+            Vec::new(), // EOF without an acknowledgement.
+            (MAX_RESPONSE_BYTES as u32 + 1).to_le_bytes().to_vec(),
+            vec![3, 0, 0, 0, 1, 0xff, 0], // Invalid UTF-8 in the response string.
+        ];
+        for (case, frame) in frames.into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir()?;
+            let socket_path = temp_dir.path().join("test.sock");
+            let listener = UnixListener::bind(&socket_path)?;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                stream.write_all(&frame).await.unwrap();
+            });
+            let message = PamMessage::change_password(
+                "testuser".to_string(),
+                b"old".to_vec(),
+                b"new".to_vec(),
+            );
+            let result = send_secret_to_daemon_async(
+                message,
+                unsafe { libc::geteuid() },
+                false,
+                Some(socket_path),
+            )
+            .await;
+            match case {
+                0 => assert!(matches!(result, Err(SocketError::Rejected))),
+                1 => assert!(matches!(result, Err(SocketError::Receive(_)))),
+                _ => assert!(
+                    matches!(result, Err(SocketError::InvalidResponse(_))),
+                    "case {case}: {result:?}"
+                ),
+            }
+            server.await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_response_timeout() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let socket_path = temp_dir.path().join("test.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            // Even a partial length prefix must not keep PAM waiting forever.
+            stream.write_all(&[1]).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let message =
+            PamMessage::change_password("testuser".to_string(), b"old".to_vec(), b"new".to_vec());
+        let result = send_secret_to_daemon_async(
+            message,
+            unsafe { libc::geteuid() },
+            false,
+            Some(socket_path),
+        )
+        .await;
+        assert!(matches!(result, Err(SocketError::Timeout)));
+        server.abort();
+        let _ = server.await;
         Ok(())
     }
 }
