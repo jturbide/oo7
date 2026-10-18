@@ -1,0 +1,56 @@
+# Pinned personal integration build; service/PAM activation is deliberately manual.
+pkgname=oo7-local-git
+pkgver=0.7.0.r1240.g79e0ba4
+pkgrel=1
+pkgdesc='Pinned oo7 Secret Service, PAM, CLI and portal with reviewed desktop fixes'
+arch=('x86_64')
+url='https://github.com/jTurbide/oo7'
+license=('MIT')
+depends=('glibc' 'libgcc' 'pam' 'dbus' 'systemd' 'xdg-desktop-portal' 'gcr')
+makedepends=('cargo' 'git' 'python' 'gettext' 'pkgconf')
+provides=('org.freedesktop.secrets')
+conflicts=('oo7' 'gnome-keyring' 'oo7-local-beta')
+replaces=('oo7-local-beta')
+# Match upstream Cargo release settings; avoid host-specific -march/native flags.
+# Preserve the reviewed ELF files without makepkg stripping or injecting LTO.
+options=('!buildflags' '!strip' '!debug' '!lto')
+_commit=79e0ba4b388faa2313ab38d35cbda2cc4372206b
+source=("oo7::git+https://github.com/jTurbide/oo7.git#commit=$_commit"
+        'render-data.py' 'org.freedesktop.secrets.service' 'README.md')
+sha256sums=('SKIP' '292677ece89edb08d0ee3cd077018bdab193b589ad998bbe0078156aed91379b' 'd149bc2a9f10d06be10da23fd003e06c55efc316c7119e0661cb900e43c1d904' 'cb0daba1f2c083519c86f50f2da8c7563c402c4467351e7ddc01b4ffd54c381d')
+
+build() {
+  cd "$srcdir/oo7"
+  [[ $(git rev-parse HEAD) == "$_commit" ]]
+  git diff --quiet HEAD -- . ':!packaging/arch'
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  export OO7_DAEMON_LOGIN_PATH=/usr/lib/oo7-daemon-login
+  cargo build --locked --release -p oo7-daemon -p oo7-pam -p oo7-cli -p oo7-portal
+}
+
+check() {
+  cd "$srcdir/oo7"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  export OO7_DAEMON_LOGIN_PATH=/usr/lib/oo7-daemon-login
+  cargo test --locked --release -p oo7-pam --lib
+  cargo test --locked --release -p oo7 --no-default-features \
+    --features tokio,native_crypto --test file_unlocked_keyring
+}
+
+package() {
+  cd "$srcdir/oo7"
+  local target="${CARGO_TARGET_DIR:-$srcdir/target}/release"
+  install -Dm755 "$target/oo7-daemon" "$pkgdir/usr/lib/oo7-daemon"
+  install -Dm755 "$target/oo7-daemon-login" "$pkgdir/usr/lib/oo7-daemon-login"
+  install -Dm755 "$target/oo7-portal" "$pkgdir/usr/lib/oo7-portal"
+  install -Dm755 "$target/libpam_oo7.so" "$pkgdir/usr/lib/security/pam_oo7.so"
+  install -Dm755 "$target/oo7-cli" "$pkgdir/usr/bin/oo7-cli"
+  python "$srcdir/render-data.py" "$srcdir/oo7" "$pkgdir"
+  install -Dm644 "$srcdir/org.freedesktop.secrets.service" \
+    "$pkgdir/usr/share/dbus-1/services/org.freedesktop.secrets.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$startdir/PKGBUILD" "$pkgdir/usr/share/doc/$pkgname/PKGBUILD"
+  install -Dm644 "$srcdir/render-data.py" "$pkgdir/usr/share/doc/$pkgname/render-data.py"
+  printf '%s\n' "$_commit" > "$pkgdir/usr/share/doc/$pkgname/SOURCE-COMMIT"
+}
