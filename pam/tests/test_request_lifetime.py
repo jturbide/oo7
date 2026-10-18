@@ -88,10 +88,11 @@ class RequestLifetimeTests(unittest.TestCase):
             data += chunk
         return data
 
-    def check_delivery(self, operation):
+    def check_delivery(self, operation, respond=True):
         socket_path = self.directory / f"{operation}.sock"
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(socket_path))
+            self.addCleanup(socket_path.unlink)
             os.chmod(socket_path, 0o600)
             listener.listen(1)
             process = self.start_caller(operation, socket_path)
@@ -111,10 +112,12 @@ class RequestLifetimeTests(unittest.TestCase):
                     select.select([process.stdout], [], [], 0.1)[0],
                     "PAM returned while its request was still awaiting a response",
                 )
-                # GVariant (bool true, empty string), with the PAM frame prefix.
-                response = b"\x01\x00"
-                connection.sendall(struct.pack("<I", len(response)) + response)
-            output, errors = process.communicate(timeout=5)
+                if respond:
+                    # GVariant (bool true, empty string), with the PAM frame prefix.
+                    response = b"\x01\x00"
+                    connection.sendall(struct.pack("<I", len(response)) + response)
+                # Keep the peer connected while checking the response timeout.
+                output, errors = process.communicate(timeout=5 if respond else 10)
             self.assertEqual(process.returncode, 0, errors.decode(errors="replace"))
             self.assertEqual(output, b"returned 0\n")
 
@@ -123,6 +126,9 @@ class RequestLifetimeTests(unittest.TestCase):
 
     def test_password_change_waits_for_delivery(self):
         self.check_delivery("password")
+
+    def test_unresponsive_daemon_still_returns_success(self):
+        self.check_delivery("session", respond=False)
 
     def test_unavailable_daemon_still_returns_success(self):
         for operation in ("session", "password"):

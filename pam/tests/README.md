@@ -12,6 +12,9 @@ The tests run short-lived C applications through Linux-PAM with dummy passwords,
 a temporary `pam_start_confdir` configuration, and a private socket that delays
 its response. Both session opening and password changes must finish sending
 before PAM returns. An unavailable daemon must still allow PAM to succeed.
+A connected daemon that reads the request but never replies must allow PAM to
+succeed after the existing response timeout. This tests that response wait, not
+an overall deadline for every transport or helper path.
 
 No root privileges, installed daemon, real keyrings, or changes to `/etc/pam.d`
 are needed. Run as a user with its normal primary group. The module may write
