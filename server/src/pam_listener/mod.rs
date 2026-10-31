@@ -192,10 +192,6 @@ impl PamListener {
         let response = match message.operation {
             PamOperation::Unlock => {
                 tracing::info!("Received unlock request for user: {}", message.username);
-                tracing::debug!(
-                    "Received secret of length {} bytes",
-                    message.new_secret.len()
-                );
 
                 let secret = Secret::from(message.new_secret.to_vec());
                 self.user_secrets
@@ -225,11 +221,6 @@ impl PamListener {
                 tracing::info!(
                     "Received password change request for user: {}",
                     message.username
-                );
-                tracing::debug!(
-                    "Old secret: {} bytes, new secret: {} bytes",
-                    message.old_secret.len(),
-                    message.new_secret.len()
                 );
 
                 let old_secret = Secret::from(message.old_secret.to_vec());

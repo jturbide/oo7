@@ -76,11 +76,7 @@ unsafe fn get_auth_token_internal(
     let password_cstr = unsafe { CStr::from_ptr(authtok_ptr as *const c_char) };
     let password_bytes = password_cstr.to_bytes().to_vec();
 
-    tracing::debug!(
-        "Captured {} of length {} bytes",
-        item_name,
-        password_bytes.len()
-    );
+    tracing::debug!("Captured {}", item_name);
 
     Ok(Zeroizing::new(password_bytes))
 }
@@ -152,10 +148,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         return PAM_SUCCESS;
     }
 
-    tracing::info!(
-        "Captured authentication token of length {} bytes, stashing for session",
-        password.len()
-    );
+    tracing::info!("Captured authentication token, stashing for session");
 
     // Stash the password for later use in pam_sm_open_session
     let boxed_password = Box::new(password.clone());
@@ -246,10 +239,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
     }
 
     let password = unsafe { &*(password_ptr as *const Zeroizing<Vec<u8>>) };
-    tracing::debug!(
-        "Retrieved stashed password of length {} bytes",
-        password.len()
-    );
+    tracing::debug!("Retrieved stashed password");
 
     // Get username and UID
     let username = match unsafe { get_user(pamh) } {
@@ -363,12 +353,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(
             return PAM_SUCCESS;
         }
 
-        tracing::info!(
-            "Password change for user {}: old={} bytes, new={} bytes",
-            username,
-            old_password.len(),
-            new_password.len()
-        );
+        tracing::info!("Password change for user {}", username);
 
         let message = PamMessage::change_password(
             username.clone(),
